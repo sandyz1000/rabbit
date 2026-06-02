@@ -1,6 +1,6 @@
 /// Inbound proxy handler and health endpoint.
 ///
-/// Catches all HTTP requests not handled by gRPC routes.
+/// Catches all HTTP requests not handled by the tunnel endpoint.
 /// Reads X-Tunnel-Port, routes to the registered agent via TunnelCoordinator,
 /// and streams the response back chunk by chunk.
 use std::collections::HashMap;
@@ -84,7 +84,7 @@ pub(crate) async fn proxy_handler(
     };
 
     let body_stream = ReceiverStream::new(head.body_rx)
-        .map(|chunk| Ok::<Bytes, std::convert::Infallible>(chunk));
+        .map(Ok::<Bytes, std::convert::Infallible>);
 
     let mut builder = Response::builder().status(head.status as u16);
     for (k, v) in &head.headers {

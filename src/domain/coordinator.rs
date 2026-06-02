@@ -12,9 +12,9 @@ use super::types::{AuthProof, InboundRequest, ServiceInfo, TunnelFrame};
 pub struct AgentHandle {
     #[allow(dead_code)]
     pub assigned_port: u16,
-    /// Coordinator → gRPC stream: coordinator pushes frames here; the adapter drains and sends.
+    /// Coordinator → tunnel stream: coordinator pushes frames here; the adapter drains and sends.
     pub outbound_rx: mpsc::Receiver<TunnelFrame>,
-    /// gRPC stream → coordinator: adapter pushes decoded frames here; relay_loop receives them.
+    /// Tunnel stream → coordinator: adapter pushes decoded frames here; relay_loop receives them.
     pub inbound_tx: mpsc::Sender<TunnelFrame>,
 }
 

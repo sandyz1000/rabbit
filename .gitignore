@@ -23,3 +23,5 @@ target
 .vscode
 .DS_Store
 .memserch
+.agents
+.memserch/

@@ -1,9 +1,3 @@
-/// CLI entry point for rabbit — HTTP tunnel over gRPC / HTTP2.
-///
-/// Mirrors bore's main.rs: same subcommand names (local / server / services),
-/// same flag names, same print_services() output format.
-/// Env vars: RABBIT_* prefix.
-
 mod adapter;
 mod auth;
 mod client;
@@ -25,13 +19,8 @@ use auth::Authenticator;
 use client::Client;
 use server::Server;
 
-pub(crate) mod rabbit {
-    tonic::include_proto!("rabbit");
-}
-
-
 #[derive(Parser, Debug)]
-#[clap(author, version, about = "rabbit — HTTP tunnel via gRPC / HTTP2")]
+#[clap(author, version, about = "rabbit — HTTP tunnel over HTTP/2")]
 struct Args {
     #[clap(subcommand)]
     command: Command,
@@ -80,7 +69,7 @@ enum Command {
         #[clap(short, long, env = "RABBIT_SECRET", hide_env_values = true)]
         secret: Option<String>,
 
-        /// Port to bind the HTTP/gRPC server on.
+        /// Port to bind the HTTP/2 server on.
         #[clap(long, default_value_t = 8080, env = "PORT")]
         bind_port: u16,
     },

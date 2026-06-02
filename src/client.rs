@@ -1,7 +1,4 @@
-/// gRPC tunnel client — wraps AgentTransport and handles per-request HTTP relay.
-///
-/// No tonic or protobuf types appear here. All transport is via AgentTransport;
-/// all framing is via domain TunnelFrame.
+/// Tunnel client — wraps AgentTransport and handles per-request HTTP relay.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,7 +42,7 @@ impl Client {
         let (assigned_port, transport, inbound_rx) =
             AgentTransport::connect(to, namespace, auth.as_ref(), port).await?;
 
-        info!(assigned_port, "connected to rabbit server (gRPC)");
+        info!(assigned_port, "connected to rabbit server");
         info!("listening at {to}:{assigned_port}");
 
         let http = Arc::new(
