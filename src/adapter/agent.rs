@@ -1,21 +1,14 @@
-/// AgentTransport — wraps the generated RabbitTunnelClient.
-/// This is the only place in the codebase that constructs a RabbitTunnelClient.
-/// All public methods speak domain types; generated names stay inside this file.
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
+use bytes::Bytes;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic::Request;
-use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
+use tokio_stream::StreamExt as _;
 
+use crate::adapter::codec::{FrameDecoder, encode_frame};
 use crate::auth::Authenticator;
 use crate::domain::types::{ServiceInfo, TunnelFrame};
-use crate::rabbit::{
-    GetPortsRequest, ListServicesRequest, TunnelMessage, rabbit_client::RabbitClient,
-};
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -24,100 +17,117 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn make_endpoint(to: &str) -> String {
-    if to.starts_with("http://") || to.starts_with("https://") {
-        to.to_string()
-    } else {
-        format!("http://{to}")
+fn make_url(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    format!("{base}{path}")
+}
+
+fn auth_headers(ts: u64, auth: Option<&Authenticator>) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(&ts.to_string()) {
+        map.insert(HeaderName::from_static("x-rabbit-ts"), v);
     }
+    let tag = auth.map(|a| a.sign(&ts.to_le_bytes())).unwrap_or_default();
+    if let Ok(v) = HeaderValue::from_str(&tag) {
+        map.insert(HeaderName::from_static("x-rabbit-auth"), v);
+    }
+    map
+}
+
+fn build_http2_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder().http2_prior_knowledge().build()?)
 }
 
 /// Client-side transport handle for a connected tunnel agent.
 pub struct AgentTransport {
-    /// Sends domain TunnelFrames to the server over the gRPC stream.
-    tx: mpsc::UnboundedSender<TunnelMessage>,
-    /// Assigned virtual port returned by the server in the Hello frame.
-    #[allow(dead_code)]
-    pub assigned_port: u16,
+    tx: mpsc::UnboundedSender<Bytes>,
 }
 
 impl AgentTransport {
     /// Connect to the rabbit server and perform the initial Hello handshake.
+    ///
     /// Returns `(assigned_port, transport, domain_frame_receiver)`.
-    /// The receiver yields domain `TunnelFrame` values; proto types stay inside this module.
+    /// The receiver yields domain `TunnelFrame` values; wire encoding stays inside this module.
     pub async fn connect(
         server_url: &str,
         namespace: &str,
         auth: Option<&Authenticator>,
         requested_port: u16,
     ) -> Result<(u16, Self, mpsc::Receiver<TunnelFrame>)> {
-        let channel = Channel::from_shared(make_endpoint(server_url))?
-            .connect()
-            .await?;
-        let mut grpc = RabbitClient::new(channel);
-
-        let (tx, rx) = mpsc::unbounded_channel::<TunnelMessage>();
-
-        // Send the client-side Hello with port hint as the first frame.
-        tx.send(TunnelMessage::from(TunnelFrame::Hello {
-            assigned_port: requested_port,
-        }))?;
-
+        let client = build_http2_client()?;
         let ts = now_secs();
-        let auth_tag = auth.map(|a| a.sign(&ts.to_le_bytes())).unwrap_or_default();
 
-        let mut request = Request::new(UnboundedReceiverStream::new(rx));
-        let meta = request.metadata_mut();
-        meta.insert("x-rabbit-service", MetadataValue::try_from(namespace)?);
-        meta.insert(
-            "x-rabbit-ts",
-            MetadataValue::try_from(ts.to_string().as_str())?,
+        let (body_tx, body_rx) = mpsc::unbounded_channel::<Bytes>();
+        let body_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(body_rx)
+            .map(Ok::<_, std::convert::Infallible>);
+
+        let mut headers = auth_headers(ts, auth);
+        headers.insert(
+            HeaderName::from_static("x-rabbit-cmd"),
+            HeaderValue::from_static("tunnel"),
         );
-        meta.insert("x-rabbit-auth", MetadataValue::try_from(auth_tag.as_str())?);
-        meta.insert(
-            "x-rabbit-port",
-            MetadataValue::try_from(requested_port.to_string().as_str())?,
+        headers.insert(
+            HeaderName::from_static("x-rabbit-service"),
+            HeaderValue::from_str(namespace).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
+        headers.insert(
+            HeaderName::from_static("x-rabbit-port"),
+            HeaderValue::from_str(&requested_port.to_string())?,
         );
 
-        let response = grpc.tunnel(request).await?;
-        let mut stream = response.into_inner();
+        let response = client
+            .post(make_url(server_url, "/rabbit"))
+            .headers(headers)
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .send()
+            .await?;
 
-        // First frame must be Hello { assigned_port }.
-        let assigned_port = match stream.next().await {
-            Some(Ok(msg)) => match TunnelFrame::try_from(msg) {
-                Ok(TunnelFrame::Hello { assigned_port }) => assigned_port,
-                Ok(TunnelFrame::Error(e)) => bail!("server error: {e}"),
-                _ => bail!("unexpected initial frame from server"),
-            },
-            Some(Err(e)) => bail!("connection error: {e}"),
-            None => bail!("server closed stream before Hello"),
+        if !response.status().is_success() {
+            bail!("server rejected connection: {}", response.status());
+        }
+
+        // First frame from the server must be Hello { assigned_port }.
+        let mut byte_stream = response.bytes_stream();
+        let mut decoder = FrameDecoder::new();
+
+        let assigned_port = loop {
+            let Some(chunk) = byte_stream.next().await else {
+                bail!("server closed stream before Hello");
+            };
+            decoder.feed(chunk?);
+            if let Some(result) = decoder.next_frame() {
+                match result? {
+                    TunnelFrame::Hello { assigned_port } => break assigned_port,
+                    TunnelFrame::Error(e) => bail!("server error: {e}"),
+                    _ => bail!("unexpected initial frame from server"),
+                }
+            }
         };
 
-        // Spawn a converter task: proto stream → domain frame channel.
-        // This keeps TunnelMessage out of the caller (client.rs).
+        // Spawn: server → client stream decoded into domain frames.
         let (domain_tx, domain_rx) = mpsc::channel::<TunnelFrame>(64);
         tokio::spawn(async move {
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(msg) => match TunnelFrame::try_from(msg) {
-                        Ok(frame) => {
-                            if domain_tx.send(frame).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => {}
-                    },
-                    Err(_) => break,
+            while let Some(result) = byte_stream.next().await {
+                let Ok(chunk) = result else { break };
+                decoder.feed(chunk);
+                while let Some(frame_result) = decoder.next_frame() {
+                    let Ok(frame) = frame_result else { break };
+                    if domain_tx.send(frame).await.is_err() {
+                        return;
+                    }
                 }
             }
         });
 
-        Ok((assigned_port, Self { tx, assigned_port }, domain_rx))
+        Ok((assigned_port, Self { tx: body_tx }, domain_rx))
     }
 
-    /// Send a domain frame to the server.
+    /// Encode and send a domain frame to the server.
     pub fn send_frame(&self, frame: TunnelFrame) -> Result<()> {
-        Ok(self.tx.send(TunnelMessage::from(frame))?)
+        let encoded = encode_frame(&frame)?;
+        self.tx
+            .send(encoded)
+            .map_err(|_| anyhow::anyhow!("tunnel send channel closed"))
     }
 
     // ── Service-discovery helpers (used by the `services` CLI subcommand) ──
@@ -126,21 +136,19 @@ impl AgentTransport {
         server_url: &str,
         auth: Option<&Authenticator>,
     ) -> Result<Vec<ServiceInfo>> {
-        let channel = Channel::from_shared(make_endpoint(server_url))?
-            .connect()
-            .await?;
-        let mut grpc = RabbitClient::new(channel);
+        let client = build_http2_client()?;
         let ts = now_secs();
-        let auth_tag = auth.map(|a| a.sign(&ts.to_le_bytes())).unwrap_or_default();
-        let resp = grpc
-            .list_services(ListServicesRequest { ts, auth: auth_tag })
+        let mut headers = auth_headers(ts, auth);
+        headers.insert(
+            HeaderName::from_static("x-rabbit-cmd"),
+            HeaderValue::from_static("list_services"),
+        );
+        let response = client
+            .post(make_url(server_url, "/rabbit"))
+            .headers(headers)
+            .send()
             .await?;
-        Ok(resp
-            .into_inner()
-            .services
-            .into_iter()
-            .map(ServiceInfo::from)
-            .collect())
+        Ok(response.json::<Vec<ServiceInfo>>().await?)
     }
 
     pub async fn get_ports(
@@ -148,25 +156,23 @@ impl AgentTransport {
         namespace: &str,
         auth: Option<&Authenticator>,
     ) -> Result<Vec<u16>> {
-        let channel = Channel::from_shared(make_endpoint(server_url))?
-            .connect()
-            .await?;
-        let mut grpc = RabbitClient::new(channel);
+        let client = build_http2_client()?;
         let ts = now_secs();
-        let auth_tag = auth.map(|a| a.sign(&ts.to_le_bytes())).unwrap_or_default();
-        let resp = grpc
-            .get_ports(GetPortsRequest {
-                name: namespace.to_string(),
-                ts,
-                auth: auth_tag,
-            })
+        let mut headers = auth_headers(ts, auth);
+        headers.insert(
+            HeaderName::from_static("x-rabbit-cmd"),
+            HeaderValue::from_static("get_ports"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-rabbit-service"),
+            HeaderValue::from_str(namespace).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
+        let response = client
+            .post(make_url(server_url, "/rabbit"))
+            .headers(headers)
+            .send()
             .await?;
-        Ok(resp
-            .into_inner()
-            .ports
-            .into_iter()
-            .map(|p| p as u16)
-            .collect())
+        Ok(response.json::<Vec<u16>>().await?)
     }
 }
 
@@ -174,24 +180,31 @@ impl AgentTransport {
 mod tests {
     use super::*;
 
-    #[test]
-    fn make_endpoint_already_http() {
-        assert_eq!(
-            make_endpoint("http://localhost:8080"),
-            "http://localhost:8080"
-        );
-    }
+    mod make_url {
+        use super::*;
 
-    #[test]
-    fn make_endpoint_no_scheme() {
-        assert_eq!(make_endpoint("localhost:8080"), "http://localhost:8080");
-    }
+        #[test]
+        fn appends_path_to_base() {
+            assert_eq!(
+                make_url("http://localhost:8080", "/rabbit"),
+                "http://localhost:8080/rabbit"
+            );
+        }
 
-    #[test]
-    fn make_endpoint_https_passthrough() {
-        assert_eq!(
-            make_endpoint("https://rabbit.fly.dev"),
-            "https://rabbit.fly.dev"
-        );
+        #[test]
+        fn strips_trailing_slash_from_base() {
+            assert_eq!(
+                make_url("http://localhost:8080/", "/rabbit"),
+                "http://localhost:8080/rabbit"
+            );
+        }
+
+        #[test]
+        fn works_without_scheme() {
+            assert_eq!(
+                make_url("localhost:8080", "/rabbit"),
+                "localhost:8080/rabbit"
+            );
+        }
     }
 }

@@ -12,7 +12,7 @@ use crate::domain::types::TunnelFrame;
 
 /// Drive the inbound frame loop for one connected agent.
 ///
-/// `inbound_rx`  – domain frames from the agent (already converted from proto by the adapter).
+/// `inbound_rx`  – domain frames from the agent (decoded from the wire by the adapter).
 /// `pending`     – shared table of oneshot senders waiting for `ResponseHead`.
 pub(crate) async fn relay_loop(
     mut inbound_rx: mpsc::Receiver<TunnelFrame>,
@@ -42,10 +42,10 @@ pub(crate) async fn relay_loop(
                 }
             }
             TunnelFrame::ResponseChunk { request_id, data } => {
-                if let Some(tx) = body_senders.get(&request_id.0) {
-                    if tx.send(data).await.is_err() {
-                        body_senders.remove(&request_id.0);
-                    }
+                if let Some(tx) = body_senders.get(&request_id.0)
+                    && tx.send(data).await.is_err()
+                {
+                    body_senders.remove(&request_id.0);
                 }
             }
             TunnelFrame::ResponseEnd { request_id } => {

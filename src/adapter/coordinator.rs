@@ -1,227 +1,190 @@
-/// TonicCoordinator — implements the generated Rabbit tonic service trait.
-/// This is the only file besides adapter/proto.rs that may import generated
-/// service names (Rabbit, RabbitServer, rabbit_server, TunnelMessage, *Request, *Response).
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
+use axum::Json;
+use axum::body::Body;
+use axum::extract::{FromRef, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status, Streaming};
 use tracing::warn;
 
+use crate::adapter::codec::{FrameDecoder, encode_frame};
+use crate::auth::Authenticator;
 use crate::domain::coordinator::TunnelCoordinator;
-use crate::domain::types::{AuthProof, TunnelFrame};
-use crate::rabbit::{
-    GetPortsRequest, GetPortsResponse, ListServicesRequest, ListServicesResponse, ServiceEntry,
-    TunnelMessage,
-    rabbit_server::Rabbit,
-};
+use crate::domain::types::{AuthProof, ServiceInfo, TunnelFrame};
 use crate::shared::AUTH_WINDOW_SECS;
 
-type OutStream = ReceiverStream<Result<TunnelMessage, Status>>;
-
-/// Wraps `Arc<dyn TunnelCoordinator>` and implements the generated `Rabbit` service trait.
-pub(crate) struct TonicCoordinator {
-    inner: Arc<dyn TunnelCoordinator>,
+/// Shared router state: coordinator + optional auth secret.
+#[derive(Clone)]
+pub(crate) struct AppState {
+    pub(crate) coordinator: Arc<dyn TunnelCoordinator>,
+    pub(crate) auth: Option<Arc<Authenticator>>,
 }
 
-impl TonicCoordinator {
-    pub(crate) fn new(inner: Arc<dyn TunnelCoordinator>) -> Self {
-        Self { inner }
-    }
-
-}
-
-#[tonic::async_trait]
-impl Rabbit for TonicCoordinator {
-    type TunnelStream = OutStream;
-
-    async fn tunnel(
-        &self,
-        request: Request<Streaming<TunnelMessage>>,
-    ) -> Result<Response<Self::TunnelStream>, Status> {
-        let namespace = metadata_str(request.metadata(), "x-rabbit-service").unwrap_or_default();
-        let ts: u64 = metadata_str(request.metadata(), "x-rabbit-ts")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let auth_tag = metadata_str(request.metadata(), "x-rabbit-auth").unwrap_or_default();
-        let requested_port: u16 = metadata_str(request.metadata(), "x-rabbit-port")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        let auth_proof = if ts > 0 || !auth_tag.is_empty() {
-            Some(AuthProof { ts, tag: auth_tag })
-        } else {
-            None
-        };
-
-        let mut inbound_stream = request.into_inner();
-
-        let mut handle = self
-            .inner
-            .register_agent(namespace, auth_proof, requested_port)
-            .await
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-        // Outbound: coordinator → gRPC stream (TunnelFrame → TunnelMessage).
-        let (out_tx, out_rx) = mpsc::channel::<Result<TunnelMessage, Status>>(64);
-        let out_tx2 = out_tx.clone();
-        tokio::spawn(async move {
-            while let Some(frame) = handle.outbound_rx.recv().await {
-                let msg: TunnelMessage = frame.into();
-                if out_tx2.send(Ok(msg)).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Inbound: gRPC stream → domain TunnelFrame → relay_loop via handle.inbound_tx.
-        let inbound_tx = handle.inbound_tx;
-        tokio::spawn(async move {
-            while let Some(result) = inbound_stream.next().await {
-                match result {
-                    Ok(msg) => match TunnelFrame::try_from(msg) {
-                        // The agent sends an initial Hello; skip it — port is already
-                        // assigned by the server from the x-rabbit-port metadata header.
-                        Ok(TunnelFrame::Hello { .. }) => {}
-                        Ok(frame) => {
-                            if inbound_tx.send(frame).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => {}
-                    },
-                    Err(e) => {
-                        warn!(%e, "gRPC stream error from agent");
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Response::new(ReceiverStream::new(out_rx)))
-    }
-
-    async fn list_services(
-        &self,
-        request: Request<ListServicesRequest>,
-    ) -> Result<Response<ListServicesResponse>, Status> {
-        let r = request.into_inner();
-        let caller_fp = validate_auth_fields(self.inner.as_ref(), r.ts, &r.auth).await?;
-        let services = self.inner.list_services(caller_fp).await;
-        let entries: Vec<ServiceEntry> = services
-            .into_iter()
-            .map(|s| ServiceEntry::from((s.port, s.namespace.as_str(), s.connected_at)))
-            .collect();
-        Ok(Response::new(ListServicesResponse { services: entries }))
-    }
-
-    async fn get_ports(
-        &self,
-        request: Request<GetPortsRequest>,
-    ) -> Result<Response<GetPortsResponse>, Status> {
-        let r = request.into_inner();
-        let caller_fp = validate_auth_fields(self.inner.as_ref(), r.ts, &r.auth).await?;
-        let ports: Vec<u32> = self
-            .inner
-            .get_ports(&r.name, caller_fp)
-            .await
-            .into_iter()
-            .map(|p| p as u32)
-            .collect();
-        Ok(Response::new(GetPortsResponse { ports }))
+/// Allows handlers that only need the coordinator to keep `State<Arc<dyn TunnelCoordinator>>`.
+impl FromRef<AppState> for Arc<dyn TunnelCoordinator> {
+    fn from_ref(state: &AppState) -> Self {
+        Arc::clone(&state.coordinator)
     }
 }
 
-async fn validate_auth_fields(
-    coordinator: &dyn TunnelCoordinator,
-    ts: u64,
-    auth_tag: &str,
-) -> Result<Option<[u8; 32]>, Status> {
-    let _ = (coordinator, ts, auth_tag);
-    Ok(None) // overridden in TonicCoordinatorWithAuth
+#[derive(Debug)]
+enum RabbitCommand {
+    Tunnel,
+    ListServices,
+    GetPorts,
 }
 
-/// Full coordinator adapter when a shared secret is configured.
-pub(crate) struct TonicCoordinatorWithAuth {
-    inner: Arc<dyn TunnelCoordinator>,
-    auth: Option<Arc<crate::auth::Authenticator>>,
-}
+impl TryFrom<&str> for RabbitCommand {
+    type Error = ();
 
-impl TonicCoordinatorWithAuth {
-    pub(crate) fn new(
-        inner: Arc<dyn TunnelCoordinator>,
-        auth: Option<Arc<crate::auth::Authenticator>>,
-    ) -> Self {
-        Self { inner, auth }
-    }
-
-    fn check_auth(&self, ts: u64, auth_tag: &str) -> Result<Option<[u8; 32]>, Status> {
-        if let Some(authenticator) = &self.auth {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if now.abs_diff(ts) > AUTH_WINDOW_SECS {
-                warn!("service query rejected: timestamp out of window");
-                return Err(Status::unauthenticated("timestamp out of window"));
-            }
-            if authenticator.verify(&ts.to_le_bytes(), auth_tag).is_err() {
-                warn!("service query rejected: invalid auth");
-                return Err(Status::unauthenticated("invalid auth"));
-            }
-            Ok(Some(authenticator.fingerprint()))
-        } else {
-            Ok(None)
+    fn try_from(s: &str) -> Result<Self, ()> {
+        match s {
+            "tunnel" => Ok(Self::Tunnel),
+            "list_services" => Ok(Self::ListServices),
+            "get_ports" => Ok(Self::GetPorts),
+            _ => Err(()),
         }
     }
 }
 
-#[tonic::async_trait]
-impl Rabbit for TonicCoordinatorWithAuth {
-    type TunnelStream = OutStream;
+/// POST /rabbit — single command dispatcher.
+///
+/// The `X-Rabbit-Cmd` header selects the operation; remaining headers carry
+/// auth and parameters. Returns 400 for unknown commands.
+pub(crate) async fn command_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+) -> Response {
+    let cmd = match header_str(&headers, "x-rabbit-cmd").map(RabbitCommand::try_from) {
+        Some(Ok(cmd)) => cmd,
+        _ => return (StatusCode::BAD_REQUEST, "missing or unknown X-Rabbit-Cmd").into_response(),
+    };
 
-    async fn tunnel(
-        &self,
-        request: Request<Streaming<TunnelMessage>>,
-    ) -> Result<Response<Self::TunnelStream>, Status> {
-        TonicCoordinator::new(Arc::clone(&self.inner))
-            .tunnel(request)
-            .await
-    }
-
-    async fn list_services(
-        &self,
-        request: Request<ListServicesRequest>,
-    ) -> Result<Response<ListServicesResponse>, Status> {
-        let r = request.into_inner();
-        let caller_fp = self.check_auth(r.ts, &r.auth)?;
-        let services = self.inner.list_services(caller_fp).await;
-        let entries: Vec<ServiceEntry> = services
-            .into_iter()
-            .map(|s| ServiceEntry::from((s.port, s.namespace.as_str(), s.connected_at)))
-            .collect();
-        Ok(Response::new(ListServicesResponse { services: entries }))
-    }
-
-    async fn get_ports(
-        &self,
-        request: Request<GetPortsRequest>,
-    ) -> Result<Response<GetPortsResponse>, Status> {
-        let r = request.into_inner();
-        let caller_fp = self.check_auth(r.ts, &r.auth)?;
-        let ports: Vec<u32> = self
-            .inner
-            .get_ports(&r.name, caller_fp)
-            .await
-            .into_iter()
-            .map(|p| p as u32)
-            .collect();
-        Ok(Response::new(GetPortsResponse { ports }))
+    match cmd {
+        RabbitCommand::Tunnel => handle_tunnel(state, headers, request).await,
+        RabbitCommand::ListServices => handle_list_services(state, headers).await,
+        RabbitCommand::GetPorts => handle_get_ports(state, headers).await,
     }
 }
 
-fn metadata_str(metadata: &tonic::metadata::MetadataMap, key: &str) -> Option<String> {
-    metadata.get(key)?.to_str().ok().map(|s| s.to_string())
+// ── private handlers ──────────────────────────────────────────────────────────
+
+async fn handle_tunnel(
+    state: AppState,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+) -> Response {
+    let namespace = header_str(&headers, "x-rabbit-service")
+        .unwrap_or("")
+        .to_string();
+    let ts: u64 = header_str(&headers, "x-rabbit-ts")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let auth_tag = header_str(&headers, "x-rabbit-auth").unwrap_or("");
+    let requested_port: u16 = header_str(&headers, "x-rabbit-port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let auth_proof = (ts > 0 || !auth_tag.is_empty()).then(|| AuthProof {
+        ts,
+        tag: auth_tag.to_string(),
+    });
+
+    let handle = match state
+        .coordinator
+        .register_agent(namespace, auth_proof, requested_port)
+        .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(%e, "agent registration failed");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
+
+    let inbound_tx = handle.inbound_tx;
+    tokio::spawn(async move {
+        relay_inbound(request.into_body(), inbound_tx).await;
+    });
+
+    let outbound_stream = ReceiverStream::new(handle.outbound_rx)
+        .filter_map(|frame| encode_frame(&frame).ok())
+        .map(Ok::<_, std::convert::Infallible>);
+
+    Response::builder()
+        .header("content-type", "application/x-rabbit-stream")
+        .body(Body::from_stream(outbound_stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn handle_list_services(state: AppState, headers: HeaderMap) -> Response {
+    let caller_fp = match extract_and_validate_auth(&state.auth, &headers) {
+        Ok(fp) => fp,
+        Err(()) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let services: Vec<ServiceInfo> = state.coordinator.list_services(caller_fp).await;
+    Json(services).into_response()
+}
+
+async fn handle_get_ports(state: AppState, headers: HeaderMap) -> Response {
+    let caller_fp = match extract_and_validate_auth(&state.auth, &headers) {
+        Ok(fp) => fp,
+        Err(()) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let name = header_str(&headers, "x-rabbit-service").unwrap_or("");
+    let ports: Vec<u16> = state.coordinator.get_ports(name, caller_fp).await;
+    Json(ports).into_response()
+}
+
+// ── shared helpers ────────────────────────────────────────────────────────────
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok()
+}
+
+fn extract_and_validate_auth(
+    auth: &Option<Arc<Authenticator>>,
+    headers: &HeaderMap,
+) -> Result<Option<[u8; 32]>, ()> {
+    let Some(authenticator) = auth else {
+        return Ok(None);
+    };
+    let ts: u64 = header_str(headers, "x-rabbit-ts")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let tag = header_str(headers, "x-rabbit-auth").unwrap_or("");
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.abs_diff(ts) > AUTH_WINDOW_SECS {
+        warn!("service query rejected: timestamp out of window");
+        return Err(());
+    }
+    if authenticator.verify(&ts.to_le_bytes(), tag).is_err() {
+        warn!("service query rejected: invalid auth");
+        return Err(());
+    }
+    Ok(Some(authenticator.fingerprint()))
+}
+
+async fn relay_inbound(body: Body, inbound_tx: tokio::sync::mpsc::Sender<TunnelFrame>) {
+    let mut decoder = FrameDecoder::new();
+    let mut data_stream = body.into_data_stream();
+
+    while let Some(chunk) = data_stream.next().await {
+        let Ok(data) = chunk else { break };
+        decoder.feed(data);
+        while let Some(result) = decoder.next_frame() {
+            let Ok(frame) = result else { break };
+            if inbound_tx.send(frame).await.is_err() {
+                return;
+            }
+        }
+    }
 }

@@ -24,7 +24,7 @@ struct AgentSession {
     namespace: String,
     connected_at: u64,
     auth_fingerprint: Option<[u8; 32]>,
-    /// Sends domain TunnelFrames out to the agent's gRPC stream (via the adapter).
+    /// Sends domain TunnelFrames out to the agent's tunnel stream (via the adapter).
     tx: mpsc::Sender<TunnelFrame>,
 }
 
@@ -113,10 +113,10 @@ impl TunnelCoordinator for RegistryCoordinator {
         self.active.insert(port, Some(namespace.clone()));
         info!(port, %namespace, "agent registered");
 
-        // outbound channel: coordinator → gRPC stream (Heartbeat, InboundRequest).
+        // outbound channel: coordinator → tunnel stream (Heartbeat, InboundRequest).
         // session.tx (a clone of out_tx) allows route_request() to push Inbound frames to the agent.
         let (out_tx, out_rx) = mpsc::channel::<TunnelFrame>(64);
-        // inbound channel: gRPC stream → relay_loop (ResponseMeta/Chunk/End).
+        // inbound channel: tunnel stream → relay_loop (ResponseMeta/Chunk/End).
         let (in_tx, in_rx) = mpsc::channel::<TunnelFrame>(64);
         let adapter_inbound_tx = in_tx;
 
