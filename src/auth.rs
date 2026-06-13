@@ -5,7 +5,6 @@
 use anyhow::{ensure, Result};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 /// Wrapper around a MAC used for authenticating clients that have a secret.
 pub struct Authenticator {
@@ -31,14 +30,6 @@ impl Authenticator {
         self.fingerprint
     }
 
-    /// Generate a reply to a challenge (bore compatibility).
-    #[allow(dead_code)]
-    pub fn answer(&self, challenge: &Uuid) -> String {
-        let mut hmac = self.mac.clone();
-        hmac.update(challenge.as_bytes());
-        hex::encode(hmac.finalize().into_bytes())
-    }
-
     /// Generate an HMAC tag over arbitrary bytes (used for timestamp-based auth).
     pub fn sign(&self, data: &[u8]) -> String {
         let mut hmac = self.mac.clone();
@@ -53,17 +44,6 @@ impl Authenticator {
         Ok(())
     }
 
-    /// Validate a reply to a UUID challenge (bore compatibility).
-    #[allow(dead_code)]
-    pub fn validate(&self, challenge: &Uuid, tag: &str) -> bool {
-        if let Ok(tag_bytes) = hex::decode(tag) {
-            let mut hmac = self.mac.clone();
-            hmac.update(challenge.as_bytes());
-            hmac.verify_slice(&tag_bytes).is_ok()
-        } else {
-            false
-        }
-    }
 }
 
 #[cfg(test)]
@@ -116,11 +96,4 @@ mod tests {
         assert_eq!(a.fingerprint(), b.fingerprint());
     }
 
-    #[test]
-    fn answer_validate_roundtrip() {
-        let auth = Authenticator::new("my-secret");
-        let challenge = Uuid::new_v4();
-        let reply = auth.answer(&challenge);
-        assert!(auth.validate(&challenge, &reply));
-    }
 }

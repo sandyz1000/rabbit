@@ -1,86 +1,177 @@
 # rabbit
 
-Expose a local HTTP service through a remote server via a persistent HTTP/2 tunnel.
+Expose a local HTTP service — including WebSocket and SSE — through a remote server via a persistent TCP tunnel.
 
-Built specifically for [Fly.io](https://fly.io), where only ports 80 and 443 are publicly reachable and TLS is terminated at the edge. Raw TCP tunnels (bore, frp) don't work there — rabbit uses HTTP/2 bidirectional streaming, which passes cleanly through Fly's proxy.
+Built for [Fly.io](https://fly.io), where only ports 80/443 are publicly reachable. Rabbit opens an outbound TCP connection from your machine to the server, so no inbound firewall rules are needed.
 
 ## How it works
 
-```
-browser → Fly edge (TLS) → rabbit server (HTTP/2) → tunnel stream → rabbit agent → local service
-```
-
-The agent opens an outbound HTTP/2 stream to the server (`POST /rabbit`). The server assigns a virtual port and routes inbound HTTP requests to the right agent via an `X-Tunnel-Port` header. No inbound firewall rules needed on the agent side.
-
-## Protocol
-
-All agent-to-server communication goes through a single endpoint:
-
-```http
-POST /rabbit
-X-Rabbit-Cmd: tunnel | list_services | get_ports
+```text
+[Browser / API client]
+        │  HTTP / WebSocket  (port 80/443)
+        ▼
+[rabbit server]  ── routes by subdomain or X-Tunnel-Id ──► [TunnelAgent pool]
+                                                                    │
+                                                              raw TCP socket
+[rabbit tunnel port :8081] ◄──────── id\n ──────────── [rabbit local]
+                                                                    │
+                                                           [Local service :3000]
 ```
 
-Frames are length-prefixed JSON over the HTTP/2 stream body. No code generation or external tooling required to build.
+The agent connects to the server's tunnel port and sends its id as the first line. The server holds that socket in a pool. When a public HTTP request arrives for that id, the server grabs a socket from the pool, pipes the raw HTTP bytes through it, and the agent forwards them to your local service. Because traffic is raw TCP, WebSocket upgrades and SSE streams work with no special handling.
+
+## Quick start
+
+**1. Start the server** (Fly.io or any VPS):
+
+```sh
+rabbit server --domain tunnel.example.com --secret mysecret
+```
+
+**2. Expose a local port** (your laptop):
+
+```sh
+rabbit local 3000 --to https://tunnel.example.com --id myapp --secret mysecret
+```
+
+Your service is now reachable at `https://myapp.tunnel.example.com`.
+
+---
 
 ## Build
 
 ```sh
 cargo build --release
+# binary at target/release/rabbit
 ```
+
+---
 
 ## Usage
 
-**Start the server** (runs on Fly.io or any host):
+### `rabbit local` — expose a local service
 
 ```sh
-rabbit server --bind-port 8080 --secret mysecret
+rabbit local <port> --to <server-url> --id <subdomain>
 ```
 
-**Expose a local service** (runs on your machine):
+| Flag           | Env                 | Default     | Description                                           |
+| -------------- | ------------------- | ----------- | ----------------------------------------------------- |
+| `<port>`       | `RABBIT_LOCAL_PORT` | required    | Local port to expose                                  |
+| `--to`         | `RABBIT_SERVER`     | required    | Remote server URL (e.g. `https://rabbit.fly.dev`)     |
+| `--id`         | `RABBIT_ID`         | required    | Subdomain slug: 4–63 lowercase alphanumeric + hyphen  |
+| `--local-host` | —                   | `localhost` | Local host to forward traffic to                      |
+| `--secret`     | `RABBIT_SECRET`     | none        | Shared HMAC secret (must match server)                |
+
+The agent reconnects automatically with exponential backoff (1 s → 60 s cap) if the connection drops.
+
+**Examples:**
 
 ```sh
-rabbit local 3000 --to https://your-server.fly.dev --secret mysecret --service myapp
+# Expose localhost:3000 as myapp.tunnel.example.com
+rabbit local 3000 --to https://tunnel.example.com --id myapp --secret s3cr3t
+
+# Expose a service on a different host
+rabbit local 5432 --to https://tunnel.example.com --id db --local-host 10.0.0.5
+
+# No secret (open server)
+rabbit local 8080 --to http://localhost:8081-server --id test
 ```
 
-This forwards requests arriving at `your-server.fly.dev` (with `X-Tunnel-Port: <assigned>`) to `localhost:3000`.
-
-**List connected services**:
+### `rabbit server` — run the tunnel server
 
 ```sh
-rabbit services --to https://your-server.fly.dev --secret mysecret
+rabbit server [options]
 ```
 
-## Options
+| Flag             | Env                   | Default | Description                                                   |
+| ---------------- | --------------------- | ------- | ------------------------------------------------------------- |
+| `--http-port`    | `PORT`                | `8080`  | Port for the public HTTP server                               |
+| `--tunnel-port`  | `RABBIT_TUNNEL_PORT`  | `8081`  | Port agents connect to (TCP)                                  |
+| `--domain`       | `RABBIT_DOMAIN`       | none    | Base domain for subdomain routing (e.g. `tunnel.example.com`) |
+| `--secret`       | `RABBIT_SECRET`       | none    | Shared HMAC secret; if set, all agents must authenticate      |
 
-| Flag                        | Env                                   | Default        | Description                                        |
-| --------------------------- | ------------------------------------- | -------------- | -------------------------------------------------- |
-| `local <port>`              | `RABBIT_LOCAL_PORT`                   | —              | Local port to expose                               |
-| `--to`                      | `RABBIT_SERVER`                       | —              | Remote server URL                                  |
-| `--secret`                  | `RABBIT_SECRET`                       | none           | Shared HMAC secret                                 |
-| `--service`                 | `RABBIT_SERVICE`                      | `""`           | Service name for discovery                         |
-| `--port`                    | —                                     | `0`            | Request a specific virtual port (0 = server picks) |
-| `--bind-port`               | `PORT`                                | `8080`         | Server listen port                                 |
-| `--min-port` / `--max-port` | `RABBIT_MIN_PORT` / `RABBIT_MAX_PORT` | `1024`–`65535` | Virtual port range                                 |
+Without `--domain`, routing falls back to the `X-Tunnel-Id` header (useful for local dev).
 
-## Fly.io deployment
+---
 
-`fly.toml` must set `h2_backend = true` so Fly forwards HTTP/2 frames to the backend rather than downgrading to HTTP/1.1:
+## Local development (no domain)
 
-```toml
-[[services]]
-  internal_port = 8080
-  protocol = "tcp"
+Without a domain configured on the server, route requests using the `X-Tunnel-Id` header:
 
-  [services.concurrency]
-    type = "requests"
+```sh
+# Server (no domain)
+rabbit server --http-port 8080 --tunnel-port 8081
 
-[http_service]
-  internal_port = 8080
-  force_https = true
-  h2_backend = true
+# Agent
+rabbit local 3000 --to http://localhost:8080 --id myapp
+
+# Test with curl
+curl -H "X-Tunnel-Id: myapp" http://localhost:8080/
+
+# WebSocket test
+websocat -H "X-Tunnel-Id: myapp" ws://localhost:8080/ws
 ```
+
+---
+
+## WebSocket and SSE
+
+No extra configuration needed. Because rabbit pipes raw TCP bytes, any protocol that runs over HTTP/1.1 is forwarded transparently:
+
+```sh
+# WebSocket (production, subdomain routing)
+wscat -c wss://myapp.tunnel.example.com/ws
+
+# Server-Sent Events
+curl -N https://myapp.tunnel.example.com/events
+```
+
+---
+
+## Monitoring API
+
+```text
+GET /health                  → { "ok": true }
+GET /api/status              → { "tunnels": 3, "uptime_secs": 3600 }
+GET /api/tunnels             → [ { id, url, available_sockets, total_sockets, connected_at } ]
+GET /api/tunnels/:id         → { id, url, available_sockets, total_sockets, connected_at }
+```
+
+---
 
 ## Auth
 
-When `--secret` is set, every agent connection and service-discovery call is authenticated with an HMAC-SHA256 signature over a Unix timestamp. Connections outside a ±30-second window are rejected. Agents with the same secret can see each other's services; agents with different secrets are isolated.
+When `--secret` is set on the server, every registration request must carry an HMAC-SHA256 signature over a Unix timestamp:
+
+```text
+X-Rabbit-Ts:   <unix seconds>
+X-Rabbit-Auth: <hex(HMAC-SHA256(secret, ts_le_bytes))>
+```
+
+Connections outside a ±30-second window are rejected (replay protection). If no secret is set, the server accepts all registrations.
+
+---
+
+## Fly.io deployment
+
+A `fly.toml` and `Dockerfile` are included. Deploy with:
+
+```sh
+fly launch --no-deploy
+fly secrets set RABBIT_SECRET=<your-secret>
+fly deploy
+```
+
+The `fly.toml` exposes two services:
+
+- **Port 80/443** — public HTTP (TLS terminated by Fly edge)
+- **Port 8081** — agent tunnel connections (raw TCP)
+
+For wildcard subdomain routing (`*.tunnel.example.com → your-fly-app`), add a CNAME in your DNS:
+
+```text
+*.tunnel.example.com  CNAME  your-app.fly.dev
+```
+
+Then pass `--domain tunnel.example.com` to `rabbit server`.

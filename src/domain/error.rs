@@ -1,41 +1,45 @@
 use std::fmt;
 
-/// Errors that can occur when an agent attempts to connect.
-#[derive(Debug, PartialEq, Eq)]
+/// Errors that can occur when an agent attempts to register.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConnectError {
+    #[error("unauthenticated")]
     Unauthenticated,
+    #[error("timestamp out of window")]
     TimestampExpired,
-    PortExhausted,
-    PortInUse,
-    PortOutOfRange,
+    #[error("tunnel id already in use")]
+    IdInUse,
+    #[error("tunnel id contains invalid characters")]
+    InvalidId,
 }
 
-impl fmt::Display for ConnectError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unauthenticated => write!(f, "unauthenticated"),
-            Self::TimestampExpired => write!(f, "timestamp out of window"),
-            Self::PortExhausted => write!(f, "failed to find an available port"),
-            Self::PortInUse => write!(f, "port already in use"),
-            Self::PortOutOfRange => write!(f, "port number not in allowed range"),
-        }
-    }
-}
-
-/// Errors that can occur when routing an inbound HTTP request to an agent.
+/// Errors that can occur when routing an inbound HTTP request to a tunnel.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RoutingError {
-    NoAgent(u16),
-    AgentDisconnected,
+    NoClient(String),
+    NoSocket,
 }
 
 impl fmt::Display for RoutingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoAgent(p) => write!(f, "no tunnel agent on port {p}"),
-            Self::AgentDisconnected => write!(f, "tunnel agent disconnected"),
+            Self::NoClient(id) => write!(f, "no tunnel registered for id '{id}'"),
+            Self::NoSocket => write!(f, "tunnel has no available sockets"),
         }
     }
+}
+
+/// Low-level tunnel I/O errors.
+#[derive(Debug, thiserror::Error)]
+pub enum TunnelError {
+    #[error("tunnel id read timed out")]
+    IdTimeout,
+    #[error("tunnel id too long (max 100 bytes)")]
+    IdTooLong,
+    #[error("unknown tunnel id")]
+    UnknownId,
+    #[error("i/o error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[cfg(test)]
@@ -43,28 +47,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn connect_error_display() {
+    fn connect_error_display_unauthenticated() {
         assert_eq!(ConnectError::Unauthenticated.to_string(), "unauthenticated");
+    }
+
+    #[test]
+    fn connect_error_display_id_in_use() {
+        assert_eq!(ConnectError::IdInUse.to_string(), "tunnel id already in use");
+    }
+
+    #[test]
+    fn routing_error_display_no_client() {
         assert_eq!(
-            ConnectError::PortExhausted.to_string(),
-            "failed to find an available port"
-        );
-        assert_eq!(ConnectError::PortInUse.to_string(), "port already in use");
-        assert_eq!(
-            ConnectError::PortOutOfRange.to_string(),
-            "port number not in allowed range"
+            RoutingError::NoClient("myapp".into()).to_string(),
+            "no tunnel registered for id 'myapp'"
         );
     }
 
     #[test]
-    fn routing_error_display() {
-        assert_eq!(
-            RoutingError::NoAgent(8080).to_string(),
-            "no tunnel agent on port 8080"
-        );
-        assert_eq!(
-            RoutingError::AgentDisconnected.to_string(),
-            "tunnel agent disconnected"
-        );
+    fn routing_error_display_no_socket() {
+        assert_eq!(RoutingError::NoSocket.to_string(), "tunnel has no available sockets");
     }
 }

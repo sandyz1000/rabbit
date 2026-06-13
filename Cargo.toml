@@ -1,32 +1,28 @@
 [package]
 name = "rabbit"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [[bin]]
 name = "rabbit"
 path = "src/main.rs"
 
 [dependencies]
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
     "sync",
     "time",
+    "net",
+    "io-util",
 ] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-reqwest = { version = "0.13.3", features = [
-    "stream",
-    "rustls",
-    "json",
-    "http2",
-], default-features = false }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1"] }
+reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
 dashmap = "6"
-uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 hmac = "0.13"
@@ -35,10 +31,7 @@ hex = "0.4"
 fastrand = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-async-trait = "0.1"
 anyhow = "1"
 thiserror = "2"
 http = "1"
 http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }
-
